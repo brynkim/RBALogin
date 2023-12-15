@@ -11,25 +11,40 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 warnings.filterwarnings('ignore')
 
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
 
 class model_v2:
     def __init__(
         self,
-        data,                   # dataset
+        train_data,             # Train set
+        valid_data,             # Validation set
+        test_data,              # Test set
         criteria,               # Classification threshold
         split_ratio,            # split ratio (format: [train:validation:test])
         autoencoder_epochs,     # epochs of autoencoder
         classifier_epochs,      # epochs of classifier
         weight_for_attack,      # weight for attack
     ):
-        self.dfs = data
+        # self.dfs = train_data
+        self.train_set = train_data
+        self.valid_set = valid_data
+        self.test_set = test_data
         self.criteria = criteria
         self.split_ratio = split_ratio
 
         # 1. Encoding Categorical Features and Set Column Name List
         for target_col in ['region', 'city', 'name', 'os_name', 'device_type', 'browser_name', 'country_code']:
-            prob_df = self.dfs.groupby(target_col)['label'].mean().reset_index(name=target_col + '_prob')
-            self.dfs = self.dfs.merge(prob_df, on=target_col)
+            prob_df = self.train_set.groupby(target_col)['label'].mean().reset_index(name=target_col + '_prob')
+            self.train_set = self.train_set.merge(prob_df, on=target_col)
+        
+        for target_col in ['region', 'city', 'name', 'os_name', 'device_type', 'browser_name', 'country_code']:
+            prob_df = self.valid_set.groupby(target_col)['label'].mean().reset_index(name=target_col + '_prob')
+            self.valid_set = self.valid_set.merge(prob_df, on=target_col)
+
+        for target_col in ['region', 'city', 'name', 'os_name', 'device_type', 'browser_name', 'country_code']:
+            prob_df = self.test_set.groupby(target_col)['label'].mean().reset_index(name=target_col + '_prob')
+            self.test_set = self.test_set.merge(prob_df, on=target_col)
 
         cat_col = [
             'country_code',  # 'region_risk_grade', 'city_risk_grade', 'name_risk_grade',
@@ -42,18 +57,23 @@ class model_v2:
         label_encoders = {}
         for col in cat_col:
             le = LabelEncoder()
-            self.dfs[col] = le.fit_transform(self.dfs[col])
+            self.train_set[col] = le.fit_transform(self.train_set[col])
+            self.valid_set[col] = le.fit_transform(self.valid_set[col])
+            self.test_set[col] = le.fit_transform(self.test_set[col])
             label_encoders[col] = le  # 나중에 역변환을 위해 저장
 
         # 2. Split Dataset
-        train_iter, val_iter, test_iter = self.stratified_split(
-            target, self.split_ratio, cat_col, num_col
-        )
+        # train_iter, val_iter, test_iter = self.stratified_split(
+        #     target, self.split_ratio, cat_col, num_col
+        # )
+        train_iter = self.from_df_to_tensor(self.train_set, cat_col, num_col, target)
+        val_iter = self.from_df_to_tensor(self.valid_set, cat_col, num_col, target)
+        test_iter = self.from_df_to_tensor(self.test_set, cat_col, num_col, target)
 
         # 3. Build Model
         # 3.1 Pretrain with AutoEncoder
-        cat_cols_info = [self.dfs[col].nunique() for col in cat_col]
-        autoencoder = CategoricalAutoencoder(cat_cols_info, len(num_col), hidden_dim=50)
+        cat_cols_info = [self.train_set[col].nunique() for col in cat_col]
+        autoencoder = CategoricalAutoencoder(cat_cols_info, len(num_col), hidden_dim=50).to(device)
         optimizer = optim.Adam(autoencoder.parameters(), lr=0.001)
         criterion = nn.MSELoss()
 
@@ -74,7 +94,7 @@ class model_v2:
 
         # 3.2 Train with NN
         # 분류 모델 초기화
-        classifier = Classifier(input_dim=train_latent_vectors.size(1), hidden_dim=100, output_dim=1)
+        classifier = Classifier(input_dim=train_latent_vectors.size(1), hidden_dim=100, output_dim=1).to(device)
         classifier_optimizer = optim.Adam(classifier.parameters(), lr=0.001)
 
         # 가중치 설정: 레이블이 1인 샘플에 대해 더 높은 가중치 부여
@@ -104,60 +124,78 @@ class model_v2:
         # 테스트 함수 호출
         self.predicted_df = self.test_classifier(classifier, test_latent_data_loader, classifier_criterion)
 
-    def stratified_split(self, target, ratios, cat_col, num_col, random_state=42):
-        """
-        Splits a DataFrame into train, validation, and test sets according to the specified ratios.
+    def from_df_to_tensor(self, df, cat_col, num_col, target):
+        # 데이터를 NumPy 배열로 변환
+        cat_data_np = df[cat_col].to_numpy(dtype=np.int64)  # dtype를 int64로 명시
+        num_data_np = df[num_col].to_numpy(dtype=np.float32)
+        labels_np = df[target].to_numpy(dtype=np.float32)
 
-        :param df: DataFrame to split.
-        :param target: The target column for stratification.
-        :param ratios: List or tuple with 3 numbers representing the train, validation, and test ratios.
-        :param random_state: Random state for reproducibility.
-        :return: Three DataFrames corresponding to the train, validation, and test sets.
-        """
+        # 데이터를 텐서로 변환
+        cat_data_tensor = torch.tensor(cat_data_np, dtype=torch.long).to(device)
+        num_data_tensor = torch.tensor(num_data_np, dtype=torch.float32).to(device)
+        labels_tensor = torch.tensor(labels_np, dtype=torch.float32).to(device)
 
-        def from_df_to_tensor(df, cat_col, num_col, target):
-            # 데이터를 NumPy 배열로 변환
-            cat_data_np = df[cat_col].to_numpy(dtype=np.int64)  # dtype를 int64로 명시
-            num_data_np = df[num_col].to_numpy(dtype=np.float32)
-            labels_np = df[target].to_numpy(dtype=np.float32)
+        # DataLoader 생성
+        batch_size = 32
+        dataset = TensorDataset(cat_data_tensor, num_data_tensor, labels_tensor)
+        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-            # 데이터를 텐서로 변환
-            cat_data_tensor = torch.tensor(cat_data_np, dtype=torch.long)
-            num_data_tensor = torch.tensor(num_data_np, dtype=torch.float32)
-            labels_tensor = torch.tensor(labels_np, dtype=torch.float32)
+        return data_loader
 
-            # DataLoader 생성
-            batch_size = 32
-            dataset = TensorDataset(cat_data_tensor, num_data_tensor, labels_tensor)
-            data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # def stratified_split(self, target, ratios, cat_col, num_col, random_state=42):
+    #     """
+    #     Splits a DataFrame into train, validation, and test sets according to the specified ratios.
 
-            return data_loader
+    #     :param df: DataFrame to split.
+    #     :param target: The target column for stratification.
+    #     :param ratios: List or tuple with 3 numbers representing the train, validation, and test ratios.
+    #     :param random_state: Random state for reproducibility.
+    #     :return: Three DataFrames corresponding to the train, validation, and test sets.
+    #     """
 
-        train_ratio, val_ratio, test_ratio = ratios
-        total = sum(ratios)
-        test_size = test_ratio / total
-        val_size = val_ratio / (total - test_ratio)  # Adjusted for the remaining after test split
+    #     def from_df_to_tensor(df, cat_col, num_col, target):
+    #         # 데이터를 NumPy 배열로 변환
+    #         cat_data_np = df[cat_col].to_numpy(dtype=np.int64)  # dtype를 int64로 명시
+    #         num_data_np = df[num_col].to_numpy(dtype=np.float32)
+    #         labels_np = df[target].to_numpy(dtype=np.float32)
 
-        # First split to separate out the test set
-        df_train_val, df_test = train_test_split(
-            self.dfs,
-            test_size=test_size,
-            stratify=self.dfs[target],
-            random_state=random_state
-        )
+    #         # 데이터를 텐서로 변환
+    #         cat_data_tensor = torch.tensor(cat_data_np, dtype=torch.long)
+    #         num_data_tensor = torch.tensor(num_data_np, dtype=torch.float32)
+    #         labels_tensor = torch.tensor(labels_np, dtype=torch.float32)
 
-        # Second split to separate out the validation set
-        df_train, df_val = train_test_split(
-            df_train_val,
-            test_size=val_size,
-            stratify=df_train_val[target],
-            random_state=random_state
-        )
-        train_iter = from_df_to_tensor(df_train, cat_col, num_col, target)
-        val_iter = from_df_to_tensor(df_val, cat_col, num_col, target)
-        test_iter = from_df_to_tensor(df_test, cat_col, num_col, target)
+    #         # DataLoader 생성
+    #         batch_size = 32
+    #         dataset = TensorDataset(cat_data_tensor, num_data_tensor, labels_tensor)
+    #         data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-        return train_iter, val_iter, test_iter
+    #         return data_loader
+
+    #     train_ratio, val_ratio, test_ratio = ratios
+    #     total = sum(ratios)
+    #     test_size = test_ratio / total
+    #     val_size = val_ratio / (total - test_ratio)  # Adjusted for the remaining after test split
+
+    #     # First split to separate out the test set
+    #     df_train_val, df_test = train_test_split(
+    #         self.dfs,
+    #         test_size=test_size,
+    #         stratify=self.dfs[target],
+    #         random_state=random_state
+    #     )
+
+    #     # Second split to separate out the validation set
+    #     df_train, df_val = train_test_split(
+    #         df_train_val,
+    #         test_size=val_size,
+    #         stratify=df_train_val[target],
+    #         random_state=random_state
+    #     )
+    #     train_iter = from_df_to_tensor(df_train, cat_col, num_col, target)
+    #     val_iter = from_df_to_tensor(df_val, cat_col, num_col, target)
+    #     test_iter = from_df_to_tensor(df_test, cat_col, num_col, target)
+
+    #     return train_iter, val_iter, test_iter
 
     def train_autoencoder(self, model, data_loader, criterion, optimizer, epochs):
         model.train()
@@ -200,7 +238,7 @@ class model_v2:
             for inputs, labels in train_loader:
                 optimizer.zero_grad()
                 outputs = model(inputs)
-                labels = labels.view(-1, 1)
+                labels = labels.view(-1, 1).to(device)
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
@@ -213,7 +251,7 @@ class model_v2:
             with torch.no_grad():
                 for inputs, labels in val_loader:
                     outputs = model(inputs)
-                    labels = labels.view(-1, 1)
+                    labels = labels.view(-1, 1).to(device)
                     val_loss += criterion(outputs, labels).item()
             val_loss /= len(val_loader)
 
@@ -238,7 +276,7 @@ class model_v2:
             for inputs, labels in test_loader:
                 outputs = model(inputs)
                 probabilities = outputs  # Assuming binary classification
-                labels = labels.view(-1, 1)
+                labels = labels.view(-1, 1).to(device)
                 test_loss += criterion(outputs, labels).item()
 
                 # Use the criteria for determining the predicted labels
@@ -329,19 +367,19 @@ class EarlyStopping:
 
 
 # load dataset
-cur_dir = os.getcwd()
-data_dir = os.path.join(cur_dir, 'data')
-df_preprocessed = pd.read_csv(os.path.join(data_dir, 'preprocessed.csv'))
+# cur_dir = os.getcwd()
+# data_dir = os.path.join(cur_dir, 'data')
+# df_preprocessed = pd.read_csv(os.path.join(data_dir, 'preprocessed.csv'))
 
 # Run Model
-result = model_v2(
-    data=df_preprocessed,       # dataset
-    criteria=0.5,   # Classification threshold
-    split_ratio=[7, 1, 2], # split ratio (format: [train,validation,test])
-    autoencoder_epochs=50,     # epochs of autoencoder
-    classifier_epochs=200,      # epochs of classifier
-    weight_for_attack=15,      # weight for attack
-)
+# result = model_v2(
+#     data=df_preprocessed,       # dataset
+#     criteria=0.5,   # Classification threshold
+#     split_ratio=[7, 1, 2], # split ratio (format: [train,validation,test])
+#     autoencoder_epochs=50,     # epochs of autoencoder
+#     classifier_epochs=200,      # epochs of classifier
+#     weight_for_attack=15,      # weight for attack
+# )
 
-predicted_df = result.predicted_df
+# predicted_df = result.predicted_df
 
